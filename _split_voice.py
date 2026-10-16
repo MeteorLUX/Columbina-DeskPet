@@ -191,10 +191,26 @@ def _cut_long(a, sr, s, e, db, max_len, min_speech):
     return [x for x in (left + right) if x[1] - x[0] >= min_speech]
 
 
+def find_raw_audio():
+    """在 voice-raw/ 里找第一个音频文件作为默认输入。
+
+    以前这里写死了具体的素材文件名 —— 那属于**素材来源信息**，
+    不适合公开（本项目会上传 GitHub）。改成自动探测。
+    """
+    d = os.path.join(config.BASE_DIR, 'voice-raw')
+    if not os.path.isdir(d):
+        return ''
+    for name in sorted(os.listdir(d)):
+        if os.path.splitext(name)[1].lower() in (
+                '.wav', '.m4a', '.mp3', '.flac', '.ogg'):
+            return os.path.join(d, name)
+    return ''
+
+
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument('--src', default=os.path.join(
-        config.BASE_DIR, 'voice-raw', 'BV1KkXPBREY2.wav'))
+    ap.add_argument('--src', default=None,
+                    help='输入音频（默认取 voice-raw/ 里第一个）')
     ap.add_argument('--out', default=config.SPEECH_VOICE_DIR)
     ap.add_argument('--mode', default='hp', choices=['off', 'hp', 'gate'])
     ap.add_argument('--cutoff', type=float, default=150.0)
@@ -202,6 +218,11 @@ def main():
     ap.add_argument('--probe', action='store_true')
     ap.add_argument('--index', default=None, help='索引 json 输出路径')
     args = ap.parse_args()
+    if not args.src:
+        args.src = find_raw_audio()
+    if not args.src:
+        print('  voice-raw/ 里没有音频文件。请先放一个，或用 --src 指定。')
+        return 1
 
     print('=' * 68)
     print('切句 + 去 BGM')

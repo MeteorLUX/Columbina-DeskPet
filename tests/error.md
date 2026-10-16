@@ -20,6 +20,7 @@
 | 13 | [PowerShell 改中文源码乱码](#powershell-写文件把中文搞成乱码) | 别用 PowerShell 批量改含中文的源码 |
 | 14 | [`except Exception` 吞掉 `NameError`](#except-exception-吞掉-nameerror静态检查的必要性) | 静态检查兜底，否则降级变静默失效 |
 | 15 | [**功能藏起来等于没有**](#功能藏起来等于没有日记删除按钮不可见) | 删除按钮在窗口底部没人看见 → 改成右键日期 |
+| 16 | [**语音引擎决定了对话内容**](#语音引擎决定了对话内容导致只能配对不能真对话) | 两个正交的维度被耦合 → 切了 LLM 也用不上 |
 
 ---
 
@@ -526,6 +527,90 @@ lb.event_generate('<Button-3>', x=5, y=行中心, rootx=200, rooty=200)
 - **快捷键/右键这类隐形交互必须配可见提示**，
   否则等于把它也藏起来。
 - 不可撤销的操作**要有确认框**，尤其是用户已经误删过一次的时候。
+
+---
+
+## 语音引擎决定了对话内容（导致只能配对、不能真对话）
+
+**用户反馈**：**"我现在本地应该能与本地 llm 模型对话，但是有个语音触发的
+功能导致我不能和本地 llm 对话了，只能在本地语音库中配对。我不要这样配，
+我要本地真实 llm 对话，本地库只是用于闲聊自动说的。"**
+
+**根因**：`on_send` 里把两个**正交**的维度耦合在了一起：
+
+```python
+use_llm = mode == 'deepseek' or getattr(self, '_speech_engine_name', '') == 'edge'
+reply = self._deepseek_call(...) if use_llm else self._local_reply()
+```
+
+原意是"神经语音什么文字都能念，所以本地模式也不必迁就原声库"。
+但写成 `or` 之后语义变成：
+
+| dialogue_mode | speech_engine | 实际走哪 |
+|---|---|---|
+| local | hybrid | **本地库配对** ← 用户遇到的 |
+| local | edge | 真 LLM |
+| deepseek | 任意 | 真 LLM |
+
+于是**"出不出声"的选择（speech_engine）悄悄决定了"内容从哪来"**。
+用户把引擎设成 `hybrid`（只用原声）之后，即使对话模式是 LLM 也被拉回配对。
+
+**修法**：两个维度彻底拆开，各管各的：
+
+| 维度 | 由谁决定 | 实现位置 |
+|---|---|---|
+| **对话内容**从哪来 | `dialogue_mode` | `DialogueMixin._llm_call()` |
+| **出不出声** | `speech_engine` | `speech.py` 各引擎的 `synth()` |
+
+```python
+# 现在：内容只由 dialogue_mode 决定
+llm_reply = self._llm_call(mode, sys_prompt, snapshot)   # local 模式返回 None
+reply = self._local_reply() if llm_reply is None else llm_reply
+```
+
+顺带把对话模式扩成三个（并新增**本地模型**这条不花钱的路）：
+
+| `dialogue_mode` | 内容来源 | 花钱 | 需要 key |
+|---|---|---|---|
+| `deepseek` | DeepSeek 云端 | 有免费额度 | 是 |
+| `local_llm` | Ollama / LM Studio（本地）| **不花钱** | **否** |
+| `local` | 台词库检索配对 | 不花钱 | 否 |
+
+> 三个后端的 `/chat/completions` 都是 **OpenAI 兼容**格式，
+> 请求体完全一样，所以调用代码共用一个 `_llm_call()`，
+> 差别只有 URL / 模型名 / 要不要 key。
+
+**配套修正**：
+
+| 问题 | 修法 |
+|---|---|
+| LLM 回复没音频 → 静音，用户以为坏了 | 文档写清："只用原声"模式下 LLM 的话**只冒气泡不出声**，想听见就切 `edge` |
+| 本地模型连不上时只报 HTTP 错误 | 给出人话提示（"确认 Ollama 已启动、模型名对不对"）+ 菜单里的「测试连接」按钮真的发一次请求 |
+| `Config` 没有 `.get()` 方法 | 我第一版写了 `self.cfg.get('local_llm_url')` → `AttributeError: 'Config' object has no attribute 'get'`。改成 `self.cfg['...']`（`__getitem__` 内部就是 `dict.get`）|
+
+**防复发测试**（`tests/_speech_regress_test.py` 的 T13，共 12 项）：
+
+```
+deepseek  + hybrid -> deepseek      ✓
+deepseek  + edge   -> deepseek      ✓
+local_llm + hybrid -> local_llm     ✓
+local_llm + edge   -> local_llm     ✓
+local     + hybrid -> local_lib     ✓
+local     + edge   -> local_lib     ✓
+worker 里不再引用 speech_engine       ✓
+```
+
+**教训**：
+
+- **两个正交的概念不要写进同一个布尔表达式。**
+  "内容来源"和"输出方式"是独立的，用 `or` 连起来就制造了隐形耦合。
+- **`A or B` 型的条件要做决策矩阵。** 当时只想到"deepseek 要调 LLM"，
+  没意识到 `speech_engine` 会反向影响 `dialogue_mode='local'` 的行为。
+  列一张 (A, B) → 结果的表，6 个格子一眼就能看出问题。
+- **测试要盯着"耦合"本身**，不只是功能是否可用。
+  这个 bug 不会让任何功能报错，只是**静默走错分支** ——
+  只有专门的"路由矩阵"测试能抓住。
+
 
 
 

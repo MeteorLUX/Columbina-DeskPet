@@ -33,6 +33,7 @@ class StudyMixin:
         """学习状态初始化（由 DesktopPet.__init__ 调用）"""
         self._study_state = 'idle'      # idle / studying / paused
         self._study_start_ts = 0.0      # 本次（或本次继续后）学习开始时间戳
+        self._study_origin_ts = 0.0     # **最初**开始学习的时间戳（不受暂停/继续影响）
         self._study_pause_ts = 0.0      # 本次暂停开始时间戳
         self._study_elapsed = 0.0       # 已累计的有效学习秒数（暂停时保存）
         self._study_remind45_done = False
@@ -41,8 +42,18 @@ class StudyMixin:
         self._study_last_tick = 0.0     # 上次计时 UI 刷新时间
         self._study_win = None          # 学习面板 Toplevel
         self._study_rec_win = None      # 记录查看窗口
-        self._study_records = []        # 学习记录列表
+        self._study_records = []        # 学习记录列表（已完成）
+        self._study_resumed = False     # 本次是不是"重启后恢复"的
+        self._study_last_save = 0.0     # 上次落盘时间（限流用）
         self._load_study_records()
+        # 退出兜底：即使不是从菜单退出，也把当前学习状态存下来。
+        # 踩过的坑：原来只在菜单「退出」里调 _study_on_quit，
+        # 直接关掉程序 -> 本次学习全丢（用户报"重启后记录没了"）。
+        try:
+            import atexit
+            atexit.register(self._study_save_all)
+        except Exception:
+            pass
 
         # 计时悬浮 UI：角色左侧的「月夜竖条」（深紫圆角底 + 月牙星星 +
         # 时/分/秒三行竖排）。主窗口是品红透明窗，文字/图形一律 PIL 预渲染
@@ -261,6 +272,12 @@ class StudyMixin:
                 self._study_ui_update(f"已暂停\n{self._study_format_time(elapsed)}")
             else:
                 self._study_ui_update(self._study_format_time(elapsed))
+            # ---- 周期性落盘 ----
+            # 每次 tick（1 秒）都写盘太费；但只在退出时写又会丢数据
+            # （用户报"重启后学习记录没了"）。所以按固定间隔写一次，
+            # 崩溃最多丢 STUDY_AUTOSAVE_SEC 秒。
+            if now - self._study_last_save >= STUDY_AUTOSAVE_SEC:
+                self._save_study_records()
 
         if self._study_state == 'studying':
             # 45 分钟提醒
@@ -315,7 +332,9 @@ class StudyMixin:
             self._speak(random.choice(STUDY_ALREADY_LINES))
             return
         if self._study_state == 'paused':
-            # 继续学习：重置本段计时的起点
+            # 继续学习：重置**本段**计时的起点。
+            # 注意 _study_origin_ts（最初开始时刻）**不动** —— 它是拿来
+            # 写记录的，一旦被重置，记录的开始时间就会错（原 bug）。
             now = time.time()
             self._study_start_ts = now
             self._study_state = 'studying'
@@ -323,18 +342,23 @@ class StudyMixin:
             self._study_next_chat = now + random.uniform(STUDY_CHAT_MIN, STUDY_CHAT_MAX)
             self._set_pose('work')     # 学习期间保持 work 立绘
             self._speak(random.choice(STUDY_RESUME_LINES))
+            self._save_study_records()          # 状态变了立刻落盘
             return
         # 全新开始
         now = time.time()
         self._study_state = 'studying'
         self._study_start_ts = now
+        self._study_origin_ts = now        # 记住最初开始时刻（写记录用）
         self._study_elapsed = 0.0
         self._study_remind45_done = False
         self._study_pause_remind_done = False
         self._study_next_chat = now + random.uniform(STUDY_CHAT_MIN, STUDY_CHAT_MAX)
         self._study_last_tick = 0.0   # 立刻刷新 UI
         self._set_pose('work')         # 学习期间保持 work 立绘
-        self._speak(random.choice(STUDY_START_LINES))
+        # 如果本次是"上次中断后恢复"的，告诉她一声（否则用户不知道计时接上了）
+        if not self._study_note_resume_on_start():
+            self._speak(random.choice(STUDY_START_LINES))
+        self._save_study_records()              # 状态变了立刻落盘
 
     def study_pause(self):
         """暂停学习"""
@@ -353,6 +377,7 @@ class StudyMixin:
         self._study_pause_remind_done = False
         self._set_pose('smile')        # 暂停时恢复常态立绘（只有计时中才是 work）
         self._speak(random.choice(STUDY_PAUSE_LINES))
+        self._save_study_records()     # 状态变了立刻落盘
 
     def study_stop(self):
         """结束学习"""
@@ -372,11 +397,13 @@ class StudyMixin:
             self._speak(STUDY_TOO_SHORT_LINE)
         else:
             # 保存记录
-            start_dt = datetime.fromtimestamp(self._study_start_ts)
-            # 注意：start_ts 在继续后会被重置为最近一次的继续时间。
-            # 真正的"开始时间"应该是第一次点击开始的时间。
-            # 从记录完整性考虑，用 start_ts - 已保存累计 反推最初开始时间。
-            first_start_ts = self._study_start_ts - self._study_elapsed
+            # 【修过的 bug】原来用 `self._study_start_ts - self._study_elapsed`
+            # **反推**最初开始时间。但 start_ts 在"继续学习"时会被重置成
+            # 继续那一刻，而 elapsed 是累计的真实学习秒数（不含暂停）——
+            # 两者相减得到的根本不是真实开始时间，暂停过就会错位，
+            # 严重时 start 落到前一天 -> 面板按当天过滤就"看不见今日记录"。
+            # 现在直接用一个专门记住"最初开始时刻"的 _study_origin_ts。
+            first_start_ts = self._study_origin_ts or self._study_start_ts
             start_dt = datetime.fromtimestamp(first_start_ts)
             end_dt = datetime.fromtimestamp(now)
             record = {
@@ -393,52 +420,160 @@ class StudyMixin:
         self._study_state = 'idle'
         self._study_ui_hide()
         self._study_elapsed = 0.0
+        self._study_origin_ts = 0.0
         self._set_pose('smile')        # 结束学习，恢复常态立绘
+        # 状态变了就落盘（清掉 live，避免下次启动误以为还在学习）
+        self._save_study_records()
 
     def _study_on_quit(self):
-        """程序退出时：若正在学习，自动结束并保存"""
-        if self._study_state in ('studying', 'paused'):
-            now = time.time()
-            if self._study_state == 'studying':
-                self._study_elapsed += now - self._study_start_ts
-            duration = self._study_elapsed
-            if duration >= STUDY_MIN_SAVE_SEC:
-                first_start_ts = self._study_start_ts - self._study_elapsed
-                start_dt = datetime.fromtimestamp(first_start_ts)
-                end_dt = datetime.fromtimestamp(now)
-                record = {
-                    'start': start_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-                    'end': end_dt.strftime('%Y-%m-%dT%H:%M:%S'),
-                    'duration': int(duration),
-                }
-                self._study_records.append(record)
-                self._save_study_records()
-            self._study_state = 'idle'
+        """程序退出时：把当前学习**结算成记录**并保存。
+
+        【设计变更】这里以前是唯一的保存点，导致直接关程序就丢数据。
+        现在每次状态变化都会落盘（见 `_study_save_all`），这里只做
+        "把进行中的学习收尾成一条正式记录"，并且**只做一次**。
+        """
+        if self._study_state not in ('studying', 'paused'):
+            self._save_study_records()      # 兜底：至少把已有记录写稳
+            return
+        now = time.time()
+        if self._study_state == 'studying':
+            self._study_elapsed += now - self._study_start_ts
+            self._study_start_ts = now     # 防止重复累加
+        duration = self._study_elapsed
+        if duration >= STUDY_MIN_SAVE_SEC:
+            first_start_ts = self._study_origin_ts or self._study_start_ts
+            record = {
+                'start': datetime.fromtimestamp(first_start_ts)
+                                 .strftime('%Y-%m-%dT%H:%M:%S'),
+                'end': datetime.fromtimestamp(now)
+                               .strftime('%Y-%m-%dT%H:%M:%S'),
+                'duration': int(duration),
+                'auto': True,              # 标记：退出时自动收尾的
+            }
+            self._study_records.append(record)
+        self._study_state = 'idle'
+        self._study_elapsed = 0.0
+        self._study_origin_ts = 0.0
+        self._save_study_records()
 
     # ---------- 记录存储 ----------
+    #
+    # 【为什么这么设计】
+    # 旧版只把"已完成的学习"存文件，而且**只在退出时**写一次。
+    # 结果：直接关程序 / 崩溃 -> 整段学习凭空消失（用户真的遇到了）。
+    #
+    # 现在文件里有两块：
+    #   sessions  已完成的学习记录（面板读它）
+    #   live      当前**正在进行**的学习状态（每次变化就写）
+    # 启动时若发现 live 还在，就把它恢复成"正在学习"，并接上累计时长。
+    def _study_file_payload(self):
+        live = None
+        if self._study_state in ('studying', 'paused'):
+            # elapsed 要存**含当前进行中那一段**的总时长。
+            # 只存 self._study_elapsed 的话，正在学习时会少算"从上次
+            # 暂停/开始到现在"这一截（踩过：live 里 elapsed=0 看着像没学）。
+            elapsed = self._study_elapsed
+            if self._study_state == 'studying':
+                elapsed += max(0.0, time.time() - self._study_start_ts)
+            live = {
+                'state': self._study_state,
+                'origin_ts': self._study_origin_ts,
+                'start_ts': self._study_start_ts,
+                'elapsed': round(elapsed, 1),
+                'saved_at': time.time(),
+            }
+        return {'version': 2, 'sessions': self._study_records, 'live': live}
+
+    def _study_save_all(self):
+        """把「已完成记录 + 当前进行中的状态」一起落盘。
+
+        这是**唯一的**写盘入口，任何状态变化（开始/暂停/继续/结束）和
+        退出（含 atexit 兜底）都走它。
+        """
+        try:
+            data = self._study_file_payload()
+            tmp = STUDY_PATH + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp, STUDY_PATH)      # 原子替换，避免写一半坏掉
+            self._study_last_save = time.time()
+        except Exception:
+            pass
+
+    def _save_study_records(self):
+        """保留旧名字（别处可能还在用），内部走统一入口"""
+        self._study_save_all()
+
     def _load_study_records(self):
-        """从 study_records.json 加载记录"""
+        """从 study_records.json 加载记录，并恢复未完成的学习"""
         self._study_records = []
         if not os.path.exists(STUDY_PATH):
             return
         try:
             with open(STUDY_PATH, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-            if isinstance(data, dict) and 'sessions' in data:
-                self._study_records = data['sessions']
-            elif isinstance(data, list):
-                self._study_records = data
         except Exception:
-            self._study_records = []
+            return
 
-    def _save_study_records(self):
-        """保存记录到 study_records.json"""
+        if isinstance(data, list):           # 很老的格式：直接是数组
+            self._study_records = data
+            return
+        if not isinstance(data, dict):
+            return
+        self._study_records = data.get('sessions') or []
+
+        # ---- 恢复未完成的学习 ----
+        live = data.get('live')
+        if not isinstance(live, dict):
+            return
         try:
-            data = {'version': 1, 'sessions': self._study_records}
-            with open(STUDY_PATH, 'w', encoding='utf-8') as f:
-                json.dump(data, f, ensure_ascii=False, indent=2)
+            state = live.get('state')
+            if state not in ('studying', 'paused'):
+                return
+            origin = float(live.get('origin_ts') or 0)
+            elapsed = float(live.get('elapsed') or 0)
+            saved_at = float(live.get('saved_at') or 0)
+            if origin <= 0:
+                return
+
+            if state == 'studying':
+                # 程序关掉的这段时间**算不算学习**？不算。
+                # 只在"上次落盘之后到关闭之前"这一段是真实学过的，
+                # 但那段已经包含在 elapsed 里了（tick 会更新），
+                # 所以恢复时把 start_ts 设为现在，时长接上 elapsed。
+                now = time.time()
+                self._study_state = 'studying'
+                self._study_origin_ts = origin
+                self._study_start_ts = now
+                self._study_elapsed = elapsed
+                self._study_next_chat = now + random.uniform(
+                    STUDY_CHAT_MIN, STUDY_CHAT_MAX)
+                self._study_resumed = True
+            else:                            # paused
+                self._study_state = 'paused'
+                self._study_origin_ts = origin
+                self._study_start_ts = saved_at or time.time()
+                self._study_elapsed = elapsed
+                self._study_pause_ts = saved_at or time.time()
+                self._study_resumed = True
         except Exception:
             pass
+
+    def _study_note_resume_on_start(self):
+        """如果本次是"上次中断后恢复"的，开口告诉她一声"""
+        if not self._study_resumed:
+            return False
+        mins = int(self._study_elapsed) // 60
+        try:
+            if self._study_state == 'studying':
+                self._speak(f"……上次学到 {mins} 分钟。我接着往下计时了。")
+            else:
+                self._speak(f"……上次学到 {mins} 分钟，是暂停着的。"
+                            "要继续就说「继续学习」。")
+        except Exception:
+            pass
+        self._study_resumed = False
+        return True
 
     # ---------- 学习面板 ----------
     def study_show_panel(self):

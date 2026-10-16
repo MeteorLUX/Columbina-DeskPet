@@ -76,13 +76,20 @@ class DialogueMixin:
         def worker():
             self.root.after(0, lambda: self._set_pose('think'))
             try:
-                # 神经语音什么文字都能念 -> 本地模式也不必迁就原声库：
-                # 回复内容由人设+LLM 决定，语音直接念 LLM 输出。
-                # 检索式回答只留给本地原声引擎（hybrid，有音频才出声）。
-                use_llm = mode == 'deepseek' or \
-                    getattr(self, '_speech_engine_name', '') == 'edge'
-                reply = self._deepseek_call(sys_prompt, snapshot) \
-                    if use_llm else self._local_reply()
+                # 【重要】对话内容只由 dialogue_mode 决定。
+                #
+                # 这里曾经写成：
+                #     use_llm = mode == 'deepseek' or speech_engine == 'edge'
+                # 那是个 bug —— **语音引擎的选择不该决定对话内容**。
+                # 后果：用 hybrid（只用原声）+ local 模式时，你跟她说话
+                # 会被强行拉去"本地库检索配对"，而不是真对话。
+                # 用户原话："我不要这样配，我要本地真实 llm 对话。"
+                #
+                # 现在两个维度彻底分开：
+                #   内容来源 <- dialogue_mode（deepseek / local_llm / local）
+                #   出不出声 <- speech_engine（hybrid 有音频才出声 / edge 都念）
+                llm_reply = self._llm_call(mode, sys_prompt, snapshot)
+                reply = self._local_reply() if llm_reply is None else llm_reply
             except Exception as e:
                 reply = f"……（信号不太好。{e}）"
             self.root.after(0, lambda r=reply: self._on_reply(r))
@@ -128,26 +135,71 @@ class DialogueMixin:
                 # 实时事实：不注入的话她答时间/天气只能靠猜（会笼统、会编造）
                 + "\n\n" + self.facts_context())
 
-    def _deepseek_call(self, sys_prompt, history):
-        if not HAS_REQUESTS: return "……（没有安装 requests，我连接不上月亮。）"
-        # 实时读 Key：from-import 拿到的是启动时快照，运行期间改 config.json 不生效
-        api_key = current_api_key()
-        if not api_key:
-            return ("……（我还没有钥匙。请在 config.json 里填上 "
-                    "deepseek_api_key，我才能听懂你。）")
-        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-        payload = {"model": "deepseek-chat",
-                   "messages": [{"role": "system", "content": sys_prompt}] + history,
-                   "temperature": 0.95, "max_tokens": 200, "stream": False}
+    def _llm_call(self, mode, sys_prompt, history):
+        """统一的模型调用入口：按 mode 决定走云端还是本地。
+
+        【为什么能共用一套】
+          DeepSeek 和本地推理服务（Ollama / LM Studio / llama.cpp）都实现
+          **OpenAI 兼容**的 `/chat/completions`，请求体字段完全一样，
+          所以差别只有：URL、模型名、要不要 API key。
+
+        【三个模式的区别】
+          deepseek   云端 api.deepseek.com，需要 config.json 里的 key
+          local_llm  本地 127.0.0.1，**不需要 key、不花钱**
+          local      不调模型（走 _local_reply，从台词库挑）
+        """
+        if mode == 'local':
+            return None                       # 交给调用方走台词库
+        if not HAS_REQUESTS or requests is None:
+            return "……（没有安装 requests，我连接不上月亮。）"
+
+        local = (mode == 'local_llm')
+        if local:
+            # 端点优先用 config.json 里的（用户可能在菜单里改过）。
+            # 注意 Config 只实现了 __getitem__（内部走 dict.get，缺失返回 None），
+            # **没有 .get() 方法** —— 写成 cfg.get(...) 会 AttributeError（踩过）。
+            url = self.cfg['local_llm_url'] or LOCAL_LLM_API_URL
+            model = self.cfg['local_llm_model'] or LOCAL_LLM_MODEL
+            headers = {"Content-Type": "application/json"}   # 本地服务不要 key
+            timeout = LOCAL_LLM_TIMEOUT
+            temp = LOCAL_LLM_TEMP
+        else:
+            api_key = current_api_key()       # 实时读，不用启动快照
+            if not api_key:
+                return ("……（我还没有钥匙。请在 config.json 里填上 "
+                        "deepseek_api_key，或者把对话模式切成"
+                        "「本地模型」。）")
+            url = DEEPSEEK_API_URL
+            model = "deepseek-chat"
+            headers = {"Authorization": f"Bearer {api_key}",
+                       "Content-Type": "application/json"}
+            timeout = 40
+            temp = 0.95
+
+        payload = {"model": model,
+                   "messages": [{"role": "system", "content": sys_prompt}]
+                               + history,
+                   "temperature": temp, "max_tokens": 200,
+                   "stream": False}
         try:
-            resp = requests.post(DEEPSEEK_API_URL, headers=headers, json=payload, timeout=40)
+            resp = requests.post(url, headers=headers, json=payload,
+                                 timeout=timeout)
             resp.raise_for_status()
             return resp.json()['choices'][0]['message']['content'].strip()
         except Exception as e:
-            if getattr(e, 'response', None) is not None and e.response.status_code == 401:
+            if getattr(e, 'response', None) is not None \
+                    and e.response.status_code == 401:
                 return ("……（这把钥匙好像失效了。请检查 config.json 里的 "
                         "deepseek_api_key 是不是填对了。）")
+            if local:
+                # 本地模型最常见的错就是"服务没起"或"模型名写错"
+                return (f"……（本地模型没回应。请确认 Ollama / LM Studio "
+                        f"已经启动，且模型名「{model}」存在。{e}）")
             return f"……（我找不到声音的来处。{e}）"
+
+    def _deepseek_call(self, sys_prompt, history):
+        """保留旧名字（别处可能还在用），内部走统一入口"""
+        return self._llm_call('deepseek', sys_prompt, history)
 
     # ---------- 本地对话 ----------
     def _ensure_dialog_file(self):

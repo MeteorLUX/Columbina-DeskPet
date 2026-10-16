@@ -91,6 +91,29 @@ if not os.path.exists(IMAGE_DIR):
 # ==================== DeepSeek ====================
 DEEPSEEK_API_URL = "https://api.deepseek.com/chat/completions"
 
+# -------------------- 本地模型（不花钱的那条路）--------------------
+# 只要本地跑着一个 **OpenAI 兼容**接口的服务，就能用它对话，不需要 API key。
+#
+#   Ollama      : ollama serve            -> http://127.0.0.1:11434/v1
+#                 ollama pull qwen2.5:7b
+#   LM Studio   : 启动 Server              -> http://127.0.0.1:1234/v1
+#   llama.cpp   : llama-server -m xx.gguf  -> http://127.0.0.1:8080/v1
+#
+# 这三个的 /v1/chat/completions 请求体与 DeepSeek **完全一样**
+# （都是 OpenAI 格式），所以调用代码可以共用一套，只是换个 URL + 模型名。
+LOCAL_LLM_API_URL = "http://127.0.0.1:11434/v1/chat/completions"
+LOCAL_LLM_MODEL   = "qwen2.5:7b"     # 按你 pull 的模型改
+LOCAL_LLM_TIMEOUT = 120.0            # 本地模型冷启动可能慢，给足时间
+LOCAL_LLM_TEMP    = 0.8
+
+# 支持的对话模式（菜单用）：值 -> 显示名
+DIALOGUE_MODES = (
+    ('deepseek', 'DeepSeek 云端'),
+    ('local_llm', '本地模型（Ollama/LM Studio）'),
+    ('local', '本地台词库（离线，不调模型）'),
+)
+
+
 
 def _read_api_key():
     """按 config.json -> 环境变量 的顺序取 API Key，没有就返回 None"""
@@ -253,6 +276,9 @@ STUDY_CHAT_MAX      = 300.0       # 学习中随机对话最大间隔（秒）
 STUDY_TICK_SEC      = 1.0         # 计时 UI 刷新间隔（秒）
 STUDY_PAUSE_REMIND_SEC = 600.0    # 暂停多久后提醒"还继续学习吗"（10 分钟）
 STUDY_MIN_SAVE_SEC  = 60          # 有效学习少于多少秒不保存记录
+STUDY_AUTOSAVE_SEC  = 15.0        # 学习期间每隔多少秒把状态落盘一次
+                                  # （崩溃/直接关程序最多丢这么多秒；
+                                  #   只靠退出时保存会整段丢失，踩过）
 
 # 学习指令意图正则（打字/语音共用）
 STUDY_START_PAT  = re.compile(r"开始学习|开始计时|学习计时|start\s*study", re.I)
@@ -431,7 +457,14 @@ VENDOR_DIR = _VENDOR
 class Config:
     DEFAULTS = {
         "master_name": "旅行者",
+        # 对话内容从哪来：
+        #   'deepseek'  = DeepSeek 云端（要 key）
+        #   'local_llm' = 本地模型（Ollama / LM Studio，**不花钱、不用 key**）
+        #   'local'     = 本地台词库（离线，**不调模型**，只从库里挑）
         "dialogue_mode": "local",
+        # 本地模型端点（'local_llm' 模式用）。改这里就能切成别的本地服务
+        "local_llm_url": "http://127.0.0.1:11434/v1/chat/completions",
+        "local_llm_model": "qwen2.5:7b",
         "position": [900, 150],
         "topmost": True,
         "affinity": 0,
@@ -440,7 +473,7 @@ class Config:
         "weather_city": "",            # 城市名，如 "成都"。留空=不查天气
         "birthday": "",                # 你的生日，填 "MM-DD" 或 "YYYY-MM-DD"
         "speech_enabled": True,        # 说话时念出来（可随时用菜单关）
-        # 'hybrid' = 本地原声优先 + 克隆兜底（用户要的合并选项）
+        # 'hybrid' = 只用原声（有音频才出声）/ 'edge' = Edge 神经语音（什么都能念）
         "speech_engine": "hybrid",
         "speech_voice": "zh-CN-XiaoxiaoNeural",   # 用户只要晓晓（温柔自然）
     }

@@ -535,6 +535,81 @@ def main():
         except Exception:
             pass
 
+    # ==================== T13 对话内容与语音引擎解耦 ====================
+    # 用户报过一个 bug："语音触发的功能导致我不能和本地 llm 对话了，
+    # 只能在本地语音库中配对"。根因是 on_send 里写成了：
+    #     use_llm = mode == 'deepseek' or speech_engine == 'edge'
+    # **语音引擎的选择不该决定对话内容** —— 两件事被错误耦合。
+    # 这段守住"内容来源只由 dialogue_mode 决定"。
+    print('\nT13 对话内容与语音引擎解耦（曾经的 bug）')
+    check('配置里有三种对话模式',
+          {v for v, _l in config.DIALOGUE_MODES}
+          == {'deepseek', 'local_llm', 'local'},
+          str([v for v, _l in config.DIALOGUE_MODES]))
+    check('有本地模型端点常量（不花钱那条路）',
+          isinstance(config.LOCAL_LLM_API_URL, str)
+          and config.LOCAL_LLM_API_URL.startswith('http')
+          and isinstance(config.LOCAL_LLM_MODEL, str),
+          f'{config.LOCAL_LLM_API_URL} / {config.LOCAL_LLM_MODEL}')
+    check('本地模型默认端口是 Ollama 的 11434',
+          '11434' in config.LOCAL_LLM_API_URL, config.LOCAL_LLM_API_URL)
+
+    # 打桩：记录走了哪个后端（不发真实网络请求）
+    # 注意：桩要**真实复刻** _llm_call 的语义 —— 'local' 模式返回 None，
+    # 让上层去走台词库。别用 `(append(), x)[1]` 这种写法（执行顺序容易搞错，
+    # 我第一版就写错了，测出 3 个假失败）。
+    _calls = []
+    _orig_llm = pet._llm_call
+    _orig_local = pet._local_reply
+
+    def _fake_llm(mode, sp, h):
+        _calls.append(mode)
+        return None if mode == 'local' else f'<{mode}>'
+
+    def _fake_local():
+        _calls.append('local_lib')
+        return '<本地库配对>'
+
+    pet._llm_call = _fake_llm
+    pet._local_reply = _fake_local
+    try:
+        _expect = {'deepseek': 'deepseek', 'local_llm': 'local_llm',
+                   'local': 'local_lib'}
+        for _mode in ('deepseek', 'local_llm', 'local'):
+            for _eng in ('hybrid', 'edge'):
+                _calls.clear()
+                pet.cfg['dialogue_mode'] = _mode
+                pet._speech_engine_name = _eng
+                # 复刻 on_send 的分流（与源码保持一致的两句）
+                _r = pet._llm_call(_mode, 'sys', [])
+                _reply = pet._local_reply() if _r is None else _r
+                # local 模式下两次调用都会记 'local' 和 'local_lib'，
+                # 真正"决定回复"的是最后一个
+                _got = _calls[-1] if _calls else '(无)'
+                check(f'{_mode} + {_eng} -> {_expect[_mode]}',
+                      _got == _expect[_mode],
+                      f'实际走了 {_got}，回复 {_reply[:20]}')
+    finally:
+        pet._llm_call = _orig_llm
+        pet._local_reply = _orig_local
+
+    # 源码层断言：**只看 on_send 的 worker 代码**，注释不算。
+    # （第一版在整个文件里搜 'use_llm'，结果命中了说明这个 bug 的注释，
+    #   产生假失败 —— 断言要盯着代码，不是文字。）
+    _root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    _src = open(os.path.join(_root, 'dialogue_llm.py'),
+                encoding='utf-8').read()
+    _worker = _src.split('def worker()')[1].split('threading.Thread')[
+        0] if 'def worker()' in _src else ''
+    _wcode = '\n'.join(ln for ln in _worker.splitlines()
+                       if not ln.strip().startswith('#'))
+    check('on_send 的 worker 里不再引用 speech_engine',
+          'speech_engine' not in _wcode and '_speech_engine_name' not in _wcode,
+          '；'.join(ln.strip() for ln in _wcode.splitlines()
+                    if 'speech_engine' in ln)[:90] or '(clean)')
+    check('worker 用 _llm_call 决定内容',
+          '_llm_call' in _wcode, _wcode[:80])
+
     # ==================== 收尾：还原配置，别污染 config.json ====================
     # 测试中途把 speech_engine 改成过 'clone'、把总开关关过，
     # 必须还原成原始值，否则下一次真跑桌宠时她可能不出声（踩过这个坑）。

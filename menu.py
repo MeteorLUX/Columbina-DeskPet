@@ -28,8 +28,16 @@ class MenuMixin:
         mode_menu = Menu(self.menu, tearoff=0, bg='#2B2436', fg='#F0E8FF',
                          activebackground='#6A4BA8', activeforeground='white',
                          font=('Microsoft YaHei', 10))
-        mode_menu.add_radiobutton(label="本地对话（离线）", variable=self.mode_var, value='local', command=self._on_mode_change)
-        mode_menu.add_radiobutton(label="DeepSeek 智能对话", variable=self.mode_var, value='deepseek', command=self._on_mode_change)
+        # 三个模式的区别（决定对话**内容**从哪来）：
+        #   DeepSeek 云端 / 本地模型  -> 真实 LLM 对话
+        #   本地台词库              -> 不调模型，只从库里挑（离线）
+        for _val, _label in DIALOGUE_MODES:
+            mode_menu.add_radiobutton(label=_label, variable=self.mode_var,
+                                      value=_val,
+                                      command=self._on_mode_change)
+        mode_menu.add_separator()
+        mode_menu.add_command(label="⚙️ 设置本地模型…",
+                              command=self._set_local_llm)
         self.menu.add_cascade(label="💬 对话模式", menu=mode_menu)
 
         self.menu.add_command(label="🔄 重新加载本地对话", command=self._reload_dialogs)
@@ -92,7 +100,111 @@ class MenuMixin:
         mode = self.mode_var.get()
         self.cfg['dialogue_mode'] = mode
         self.cfg.save()
-        self._speak("……嗯，我试着听听你的声音。" if mode == 'deepseek' else "……我在这里。")
+        # 按模式给不同反馈，让用户知道"现在到底是真对话还是挑台词"
+        if mode == 'local':
+            self._speak("……我在这里。现在只用台词库，不连模型。")
+        elif mode == 'local_llm':
+            model = self.cfg.get('local_llm_model') or '?'
+            self._speak(f"……好，我连本地模型。{model}。")
+        else:
+            self._speak("……嗯，我试着听听你的声音。")
+
+    def _set_local_llm(self):
+        """设置本地模型端点与模型名（Ollama / LM Studio）。
+
+        为什么让用户填而不是写死：不同人装的本地服务端口和模型名都不一样
+        （Ollama 默认 11434 + qwen2.5:7b，LM Studio 默认 1234 + 别的名字）。
+        """
+        import tkinter as tk
+        from tkinter import simpledialog
+
+        cur_url = (self.cfg.get('local_llm_url')
+                   or 'http://127.0.0.1:11434/v1/chat/completions')
+        cur_model = self.cfg.get('local_llm_model') or 'qwen2.5:7b'
+
+        win = tk.Toplevel(self.root)
+        win.title('本地模型设置')
+        win.attributes('-topmost', True)
+        win.resizable(False, False)
+        frm = tk.Frame(win, padx=14, pady=12)
+        frm.pack()
+
+        tk.Label(frm, text='接口地址（OpenAI 兼容的 /chat/completions）',
+                 anchor='w').grid(row=0, column=0, sticky='w')
+        url_var = tk.StringVar(value=cur_url)
+        tk.Entry(frm, textvariable=url_var, width=52).grid(
+            row=1, column=0, pady=(2, 10))
+
+        tk.Label(frm, text='模型名', anchor='w').grid(row=2, column=0, sticky='w')
+        model_var = tk.StringVar(value=cur_model)
+        tk.Entry(frm, textvariable=model_var, width=52).grid(
+            row=3, column=0, pady=(2, 6))
+
+        tk.Label(frm, justify='left', anchor='w',
+                 text=('Ollama：ollama serve，然后 ollama pull qwen2.5:7b\n'
+                       '      地址 http://127.0.0.1:11434/v1/chat/completions\n'
+                       'LM Studio：启动 Server\n'
+                       '      地址 http://127.0.0.1:1234/v1/chat/completions\n'
+                       '本地模型不需要 API key，也不花钱。'),
+                 fg='#666').grid(row=4, column=0, sticky='w', pady=(6, 10))
+
+        def do_save():
+            u = url_var.get().strip()
+            m = model_var.get().strip()
+            if u:
+                self.cfg['local_llm_url'] = u
+            if m:
+                self.cfg['local_llm_model'] = m
+            self.cfg.save()
+            self._speak(f"……记住了。{m}。")
+            try:
+                win.destroy()
+            except Exception:
+                pass
+
+        btns = tk.Frame(frm)
+        btns.grid(row=5, column=0, sticky='e')
+        tk.Button(btns, text='测试连接', command=lambda: self._test_local_llm(
+            url_var.get().strip(), model_var.get().strip(), win)).pack(
+                side='left', padx=4)
+        tk.Button(btns, text='保存', command=do_save).pack(side='left', padx=4)
+
+    def _test_local_llm(self, url, model, parent=None):
+        """真的发一次请求，把结果直接告诉用户（别让他猜为什么没反应）"""
+        from tkinter import messagebox
+        import threading
+        try:
+            import requests
+        except ImportError:
+            messagebox.showerror('本地模型', '缺少 requests，无法测试。',
+                                 parent=parent)
+            return
+        if not url:
+            messagebox.showwarning('本地模型', '请先填接口地址。', parent=parent)
+            return
+
+        def work():
+            ok, msg = False, ''
+            try:
+                r = requests.post(
+                    url, json={'model': model,
+                               'messages': [{'role': 'user',
+                                             'content': '说一句「在」就行'}],
+                               'max_tokens': 20, 'stream': False},
+                    timeout=30)
+                if r.status_code == 200:
+                    txt = r.json()['choices'][0]['message']['content'].strip()
+                    ok, msg = True, f'连接成功！它回答：{txt}'
+                else:
+                    msg = f'HTTP {r.status_code}：{r.text[:200]}'
+            except Exception as e:
+                msg = (f'{type(e).__name__}: {e}\n\n'
+                       '常见原因：本地服务没启动 / 端口不对 / 模型名写错。')
+            self.root.after(0, lambda: (
+                messagebox.showinfo('本地模型', msg, parent=parent) if ok
+                else messagebox.showerror('本地模型', msg, parent=parent)))
+
+        threading.Thread(target=work, daemon=True).start()
 
     def _toggle_walk(self):
         val = bool(self.walk_var.get())

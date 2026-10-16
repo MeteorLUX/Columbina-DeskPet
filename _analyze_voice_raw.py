@@ -23,9 +23,28 @@ import miniaudio
 SR = 16000          # 分析用采样率，够看语音特征且省内存
 
 
+def find_raw_audio():
+    """在 voice-raw/ 里找第一个音频文件。
+
+    以前这里写死了某个具体的素材文件名 —— 那是**素材来源信息**，
+    不适合公开（本项目会上传 GitHub）。改成自动探测：
+    只要 voice-raw/ 里放了一个音频，就用它。
+    """
+    d = os.path.join(config.BASE_DIR, 'voice-raw')
+    if not os.path.isdir(d):
+        return ''
+    for name in sorted(os.listdir(d)):
+        if os.path.splitext(name)[1].lower() in (
+                '.wav', '.m4a', '.mp3', '.flac', '.ogg'):
+            return os.path.join(d, name)
+    return ''
+
+
 def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else os.path.join(
-        config.BASE_DIR, 'voice-raw', 'BV1KkXPBREY2.m4a')
+    path = sys.argv[1] if len(sys.argv) > 1 else find_raw_audio()
+    if not path:
+        print('  voice-raw/ 里没有音频文件。请先放一个，或用参数指定路径。')
+        return 1
     print('=' * 68)
     print('素材分析')
     print('=' * 68)
