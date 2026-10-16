@@ -216,23 +216,32 @@ class DialogueMixin:
         except Exception: return []
 
     def _local_reply(self):
-        """本地模式回答：**拿用户说的话去语音库检索**（只用原声说话）。
+        """本地台词库回答：**拿用户说的话去语音库检索**（只用原声说话）。
 
-        【调用前提】当前语音引擎是 hybrid（本地原声）。
-          引擎是 Edge 神经语音时 on_send 不会走到这里——神经语音什么
-          文字都能念，回复由人设+LLM 决定（见 on_send 的 use_llm 分流），
-          不必再迁就"必须命中库里有音频的句子"。
+        【什么时候会走到这里】
+          只有 `dialogue_mode == 'local'` 时（用户主动选了"本地台词库"）。
+          `_llm_call()` 在 local 模式下返回 None，上层据此改走这里。
 
-        【为什么 hybrid 下不是随机挑】
+        【和语音引擎无关】
+          这里**不看 speech_engine**。曾经写成
+              use_llm = mode == 'deepseek' or speech_engine == 'edge'
+          导致"引擎选 hybrid 就不能用 LLM 真对话"，那是个 bug（已修）。
+          现在：内容来源 <- dialogue_mode，出不出声 <- speech_engine。
+
+        【她主动开口走的是 _random_speakable】
+          待机搭话等场景同样会调本函数，但那时 messages 里没有用户发言，
+          于是落到 `_random_speakable()`（从**有音频**的台词里随机挑）。
+
+        【为什么不是随机挑】
           原来是 `random.choice(pool)`：随机挑一句固定台词。两个问题：
             1. 台词库里有相当一部分**没有对应音频** -> 她冒气泡但没声音
             2. 随机 = 答非所问（你问天气，她说"我习惯了有很多名字的日子"）
 
         【现在怎么做】
           用户要求"有音频的出声，没音频的就不出声，不要克隆"。
-          所以把**用户说的话**直接拿去语音库做检索（字符二元组余弦相似度），
+          所以把**用户说的话**直接拿去语音库做检索（IDF 加权 n-gram 覆盖率），
           返回最贴近的那句台词：
-            · 相似度 >= SPEECH_RETRIEVAL_MIN -> 说这句（气泡文字 = 她说的那句）
+            · 相似度 >= SPEECH_RETRIEVAL_FLOOR -> 说这句（气泡文字 = 她说的那句）
             · 否则返回 '' -> 上层不出声、也不冒气泡
 
           这样**完全不联网、不碰 API key**，且气泡和声音必然一致。

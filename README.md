@@ -88,20 +88,29 @@
 **用本地模型（不花钱的那条路）**：
 
 ```bat
-:: 1. 装 Ollama（ollama.com 下载），然后拉一个模型
-ollama pull qwen2.5:7b
+:: 1. 先把本地模型服务拉起来（便携版在 ollama\ 里，装好就有）
+start-ollama.bat
 
-:: 2. 确认服务在跑（装完一般自动常驻）
-ollama list
+:: 2. 拉一个模型（约 4.7 GB，存到 ollama-models\，不占 C 盘）
+ollama\ollama.exe pull qwen2.5:7b
 
-:: 3. 桌宠里右键 →「对话模式」→「本地模型（Ollama/LM Studio）」
-::    再「⚙️ 设置本地模型…」填地址和模型名，点「测试连接」验证
+:: 3. 确认它在
+ollama\ollama.exe list
+
+:: 4. 桌宠里右键 →「对话模式」→「本地模型（Ollama/LM Studio）」
+::    再「⚙️ 设置本地模型…」点「测试连接」验证
 ```
 
 - Ollama 地址：`http://127.0.0.1:11434/v1/chat/completions`
 - LM Studio 地址：`http://127.0.0.1:1234/v1/chat/completions`
 - 本地模型**不需要 API Key**，请求也不出你的电脑
 - 面版里的「测试连接」会真的发一次请求，连不上会直接告诉你原因
+- 想让服务开机自启：把 `start-ollama.bat` 的**快捷方式**放进
+  `Win+R` → 输入 `shell:startup` → 回车，打开的那个文件夹
+
+> **为什么用便携版**：安装版会装到 C 盘，还会往 `C:\Users\<你>\.ollama`
+> 写密钥。便携版解压在项目里，配合 `OLLAMA_MODELS` 和 `HOME` 两个环境变量
+> 重定向，**模型权重和密钥全在 E 盘**。`start-ollama.bat` 已经设好了。
 
 ### 本地台词库是干什么的
 
@@ -194,6 +203,7 @@ ollama list
 pet/
 ├── main.py                入口：启动 + 依赖自检（缺什么会人话提示）
 ├── run.bat / install.bat  一键启动 / 一键装依赖
+├── start-ollama.bat       启动本地模型服务（用 local_llm 模式才需要）
 ├── pack.bat               PyInstaller 打包成 exe
 ├── config.py              行为参数与常量（口令正则、时长、路径等）
 ├── lines.py               ★ 全部台词与人设提示词（想改她说话就改这里）

@@ -90,12 +90,40 @@ def wait_state(pet, want, timeout=15.0):
     return False
 
 
+def _can_open_local_llm(pet):
+    """「设置本地模型…」对话框能不能打开（打开就立刻关掉）
+
+    这个对话框曾因为 `self.cfg.get(...)` 抛 AttributeError 而完全打不开。
+    """
+    import tkinter as tk
+    before = set(pet.root.winfo_children())
+    try:
+        pet._set_local_llm()
+        pet.root.update()
+    except Exception:
+        return False
+    new = [w for w in pet.root.winfo_children() if w not in before]
+    titles = []
+    for w in new:
+        try:
+            titles.append(w.title())
+        except Exception:
+            pass
+        try:
+            w.destroy()
+        except Exception:
+            pass
+    pet.root.update()
+    return any('本地模型' in t for t in titles)
+
+
 def main():
     passed, failed = [], []
 
-    def check(name, cond):
+    def check(name, cond, extra=''):
         (passed if cond else failed).append(name)
-        print(('  ✓ ' if cond else '  ✗ ') + name)
+        tail = f'   {extra}' if extra else ''
+        print(('  ✓ ' if cond else '  ✗ ') + name + tail)
 
     pet = app.DesktopPet()
     pet.root.withdraw()                      # 测试时不弹窗
@@ -265,6 +293,108 @@ def main():
         check('选「想」后开唱', ok)
     finally:
         _rnd.random = old_random
+
+    # ==================== T7 右键菜单每一项都点得动 ====================
+    # 用户报过："右键菜单管理软件路径的子菜单打不开"。
+    # 根因是 menu.py 里写了 `self.cfg.get('local_llm_model')` ——
+    # Config 当时只有 __getitem__，没有 .get() -> AttributeError，
+    # 于是「对话模式」子菜单点任何一项都炸，看起来像"子菜单打不开"。
+    #
+    # 这类 bug 不报错在启动时，只有**真的去点**才暴露。所以这里遍历菜单，
+    # 逐个触发 command，任何一个抛异常都算失败。
+    print('\nT7 右键菜单 / 子菜单逐项可点')
+    import tkinter as tk
+
+    def walk_menu(m, path=''):
+        """递归收集 (显示文字, 类型, 索引) —— 含子菜单"""
+        items = []
+        try:
+            end = m.index('end')
+        except Exception:
+            return items
+        if end is None:
+            return items
+        for i in range(end + 1):
+            try:
+                t = m.type(i)
+                label = m.entrycget(i, 'label')
+            except Exception:
+                continue
+            here = f'{path}/{label}'
+            items.append((here, t, m, i))
+            if t == 'cascade':
+                try:
+                    sub = m.entrycget(i, 'menu')
+                    subw = m.nametowidget(sub)
+                    items.extend(walk_menu(subw, here))
+                except Exception:
+                    pass
+        return items
+
+    menu = pet.menu
+    items = walk_menu(menu)
+    check('菜单里有子菜单（对话模式 / 说话音色）',
+          sum(1 for _p, t, _m, _i in items if t == 'cascade') >= 2,
+          str(sum(1 for _p, t, _m, _i in items if t == 'cascade')))
+    check('菜单项数量合理（>= 15）', len(items) >= 15, str(len(items)))
+
+    # 找出「管理软件路径」这一项：它的 command 必须真的能开面板
+    paths_item = [x for x in items if '管理软件路径' in x[0]]
+    check('菜单里有「管理软件路径」', len(paths_item) == 1,
+          str([x[0] for x in paths_item]))
+    if paths_item:
+        try:
+            pet.paths_show_panel()
+            pet.root.update()
+            check('「管理软件路径」面板能打开',
+                  pet._paths_win is not None)
+            if pet._paths_win is not None:
+                check('面板标题正确',
+                      pet._paths_win.title() == '管理软件路径',
+                      pet._paths_win.title())
+                pet._paths_win.destroy()
+                pet._paths_win = None
+        except Exception as e:
+            check('「管理软件路径」面板能打开', False,
+                  f'{type(e).__name__}: {e}')
+
+    # 子菜单里的 command 逐个触发（跳过会退出的「退出」和会弹外部窗口的）
+    _SKIP = ('退出', '关于', '重新加载')
+    invoked, broken = 0, []
+    for path, t, m, i in items:
+        if t not in ('command', 'radiobutton'):
+            continue
+        label = path.rsplit('/', 1)[-1]
+        if any(s in label for s in _SKIP):
+            continue
+        # 面板类命令：先把已开的同名窗口关掉，避免"已存在就 return"掩盖问题
+        try:
+            if '管理软件路径' in label:
+                continue          # 上面已单独测过
+            m.invoke(i)
+            pet.root.update()
+            invoked += 1
+        except Exception as e:
+            broken.append(f'{label}: {type(e).__name__}: {e}')
+    check(f'子菜单/命令项逐个触发无异常（{invoked} 项）',
+          not broken, '; '.join(broken)[:200])
+
+    # 明确守住 Config.get：这个坑踩过两次
+    check('Config 支持 .get()（避免 cfg.get 抛 AttributeError）',
+          pet.cfg.get('local_llm_model') == pet.cfg['local_llm_model']
+          and pet.cfg.get('不存在的键xyz', '默认') == '默认',
+          str(pet.cfg.get('local_llm_model')))
+    # 对话模式三种都要能切（就是子菜单的单选按钮）
+    _mode_ok = []
+    for _m in ('local', 'local_llm', 'deepseek'):
+        try:
+            pet.mode_var.set(_m)
+            pet._on_mode_change()
+            _mode_ok.append(pet.cfg['dialogue_mode'] == _m)
+        except Exception:
+            _mode_ok.append(False)
+    check('「对话模式」子菜单三项都能切', all(_mode_ok), str(_mode_ok))
+    check('「设置本地模型…」对话框能打开', _can_open_local_llm(pet))
 
     pet.root.destroy()
 

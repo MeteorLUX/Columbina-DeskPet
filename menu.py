@@ -104,7 +104,10 @@ class MenuMixin:
         if mode == 'local':
             self._speak("……我在这里。现在只用台词库，不连模型。")
         elif mode == 'local_llm':
-            model = self.cfg.get('local_llm_model') or '?'
+            # 注意：Config 只实现了 __getitem__，**没有 .get()** ——
+            # 这里曾写成 self.cfg.get('local_llm_model')，导致点这一项直接
+            # AttributeError，整个「对话模式」子菜单像是"打不开"。
+            model = self.cfg['local_llm_model'] or '?'
             self._speak(f"……好，我连本地模型。{model}。")
         else:
             self._speak("……嗯，我试着听听你的声音。")
@@ -118,9 +121,11 @@ class MenuMixin:
         import tkinter as tk
         from tkinter import simpledialog
 
-        cur_url = (self.cfg.get('local_llm_url')
+        # 用 cfg['...'] 而不是 cfg.get(...)：Config 只有 __getitem__
+        # （内部走 dict.get，缺失返回 None），**没有 .get() 方法**。
+        cur_url = (self.cfg['local_llm_url']
                    or 'http://127.0.0.1:11434/v1/chat/completions')
-        cur_model = self.cfg.get('local_llm_model') or 'qwen2.5:7b'
+        cur_model = self.cfg['local_llm_model'] or 'qwen2.5:7b'
 
         win = tk.Toplevel(self.root)
         win.title('本地模型设置')

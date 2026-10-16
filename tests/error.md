@@ -21,6 +21,7 @@
 | 14 | [`except Exception` 吞掉 `NameError`](#except-exception-吞掉-nameerror静态检查的必要性) | 静态检查兜底，否则降级变静默失效 |
 | 15 | [**功能藏起来等于没有**](#功能藏起来等于没有日记删除按钮不可见) | 删除按钮在窗口底部没人看见 → 改成右键日期 |
 | 16 | [**语音引擎决定了对话内容**](#语音引擎决定了对话内容导致只能配对不能真对话) | 两个正交的维度被耦合 → 切了 LLM 也用不上 |
+| 17 | [**子菜单打不开**](#右键子菜单打不开cfgget-引发的连锁反应) | 只改调用点没改根因 → 同一个坑踩两次 |
 
 ---
 
@@ -586,7 +587,7 @@ reply = self._local_reply() if llm_reply is None else llm_reply
 |---|---|
 | LLM 回复没音频 → 静音，用户以为坏了 | 文档写清："只用原声"模式下 LLM 的话**只冒气泡不出声**，想听见就切 `edge` |
 | 本地模型连不上时只报 HTTP 错误 | 给出人话提示（"确认 Ollama 已启动、模型名对不对"）+ 菜单里的「测试连接」按钮真的发一次请求 |
-| `Config` 没有 `.get()` 方法 | 我第一版写了 `self.cfg.get('local_llm_url')` → `AttributeError: 'Config' object has no attribute 'get'`。改成 `self.cfg['...']`（`__getitem__` 内部就是 `dict.get`）|
+| `Config` 没有 `.get()` 方法 | 写了 `self.cfg.get('local_llm_url')` → `AttributeError`。**第一次只改了调用点**，结果在 `menu.py` 又踩两次（见第 17 条）。最后给 `Config` 补上了跟 dict 一致的 `get()`，从根上解决 |
 
 **防复发测试**（`tests/_speech_regress_test.py` 的 T13，共 12 项）：
 
@@ -610,6 +611,96 @@ worker 里不再引用 speech_engine       ✓
 - **测试要盯着"耦合"本身**，不只是功能是否可用。
   这个 bug 不会让任何功能报错，只是**静默走错分支** ——
   只有专门的"路由矩阵"测试能抓住。
+
+---
+
+## 右键子菜单打不开（`cfg.get()` 引发的连锁反应）
+
+**用户反馈**：**"右键菜单管理软件路径的子菜单打不开。"**
+
+**根因**：`config.Config` 是个自定义类，只实现了 `__getitem__`：
+
+```python
+class Config:
+    def __getitem__(self, k): return self.data.get(k)
+    def __setitem__(self, k, v): self.data[k] = v
+```
+
+它**没有 `get()` 方法**。但 `Config` 用起来太像 dict 了，写代码时很自然就
+`self.cfg.get('local_llm_model')` —— 于是：
+
+```python
+# menu.py 的 _on_mode_change()（「对话模式」子菜单每项都指向它）
+elif mode == 'local_llm':
+    model = self.cfg.get('local_llm_model') or '?'   # AttributeError!
+```
+
+**为什么表现成"子菜单打不开"**：
+`_on_mode_change` 是「对话模式」子菜单里**所有**单选按钮的 command。
+只要用户点其中任何一项，这个函数一进去就抛 `AttributeError`，
+调用栈随即崩掉 —— 在用户看来就是"子菜单点了没反应/打不开"。
+
+用户在菜单里看到的第一组就是「💬 对话模式」，所以先撞上的是它；
+但同一个文件里还有两处同样的写法（`_set_local_llm`），
+「⚙️ 设置本地模型…」也是一点就炸。
+
+**修法（两层）**：
+
+1. 把三处调用点改成 `self.cfg['...']`
+2. **给 `Config` 补上跟 dict 一致的 `get()`** —— 根治，而不是继续靠"记得别写"
+
+```python
+def get(self, k, default=None):
+    """像 dict 一样取值。
+
+    这个坑踩过两次。与其反复提醒，不如让它和 dict 一致。
+    """
+    v = self.data.get(k, default)
+    return default if v is None else v
+
+def __contains__(self, k): return k in self.data
+```
+
+**为什么第一次没修干净**（记下来当教训）：
+上一轮我在 `dialogue_llm.py` 遇到同样的 `cfg.get()` 报错，
+只把**那一个调用点**改成了 `cfg['...']`，并在错误日志里写了一句
+"Config 没有 .get()，要用 cfg['...']"。
+
+结果：
+- 错误日志是**给人看的文档**，不是能拦住 bug 的机制
+- 同一个类在 `menu.py` 里又被用了两次 `.get()`
+- **改调用点只是止血，改根因才是治病**
+
+**防复发测试**（`tests/_sing_regress_test.py` 的 T7，共 9 项）：
+
+```
+✓ 菜单里有子菜单（对话模式 / 说话音色）   2
+✓ 菜单项数量合理（>= 15）                 27
+✓ 菜单里有「管理软件路径」
+✓ 「管理软件路径」面板能打开
+✓ 面板标题正确                            管理软件路径
+✓ 子菜单/命令项逐个触发无异常（17 项）
+✓ Config 支持 .get()（避免 cfg.get 抛 AttributeError）
+✓ 「对话模式」子菜单三项都能切             [True, True, True]
+✓ 「设置本地模型…」对话框能打开
+```
+
+它**递归遍历整棵菜单树**（含子菜单），逐个 `invoke()` 每一项，
+任何一个抛异常都算失败 —— 这类 bug 只有"真的去点"才暴露。
+
+**教训**：
+
+- **自定义容器类要和 dict 的接口对齐。** `Config` 长得像 dict、
+  用得也像 dict，但它缺了最常用的 `.get()` —— 这种"几乎像"最容易出事。
+  要么实现完整，要么别让它看起来像 dict。
+- **改调用点是止血，改根因才是治病。** 这次同一个坑踩了两次，
+  第二次还推到了 GitHub 才被用户发现。判断标准很简单：
+  **如果同类错误还能在别处发生，就说明根因没修。**
+- **错误日志不是测试。** 写进 `error.md` 只是"以后好查"，
+  真正拦住复发的是那条遍历菜单的测试。
+- **"点不动"这类交互 bug 要遍历着测**，不能只测函数能不能调。
+  函数单独调是好的，接进菜单才炸 —— 差异就在**调用链的上下文**。
+
 
 
 

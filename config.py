@@ -522,3 +522,17 @@ class Config:
 
     def __getitem__(self, k): return self.data.get(k)
     def __setitem__(self, k, v): self.data[k] = v
+
+    def get(self, k, default=None):
+        """像 dict 一样取值。
+
+        【为什么要有这个方法】
+          Config 原来只有 `__getitem__`，没有 `.get()`。而 dict 有 `.get()`，
+          所以很容易顺手写成 `self.cfg.get('xxx')` -> AttributeError。
+          这个坑踩过两次（menu.py 的对话模式子菜单因此整块点不动，
+          表现成"子菜单打不开"）。与其反复提醒，不如让它和 dict 一致。
+        """
+        v = self.data.get(k, default)
+        return default if v is None else v
+
+    def __contains__(self, k): return k in self.data
