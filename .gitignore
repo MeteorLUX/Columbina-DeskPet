@@ -1,0 +1,80 @@
+# 本地配置：里面有 deepseek_api_key，不要提交到 Git
+config.json
+
+# 临时/构建产物
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+*.log
+
+# ---------------------------------------------------------------------------
+# 说话输出（语音）
+# ---------------------------------------------------------------------------
+# 第三方包（edge-tts 等）装在项目内 vendor/，体积大且可 pip 重装，不入库
+vendor/
+
+# 合成缓存：可再生成，且可能含大量音频
+voice-cache/
+
+# 本地原声语音文件：游戏/配音素材，版权不属于本项目，不要上传
+voice/
+
+# 原声素材来源（下载的 B 站音频等），体积大且版权不属于本项目
+voice-raw/
+
+# ASR 自动生成的"台词文字 -> 原声文件"映射
+# 内容是游戏台词的转写结果，同样属版权素材
+voice-lines.json
+voice-index.json
+
+# 视听对比等临时产物
+试听-*.wav
+voice-cmp/
+voice-cmp-off/
+
+# ASR 语音模型（SenseVoice，约 230MB）：体积大且可重新下载，不入库。
+# 注意这个目录现在**只放 ASR 模型**（model.int8.onnx + tokens.txt）；
+# 克隆相关的模型已按用户要求删除。
+voice-model/
+
+# 克隆相关的残留（已删除代码，保留规则以防以后误加回来）
+*.pth
+*.ckpt
+*.safetensors
+*.index
+reference*.wav
+xtts-try/
+voice-clone-test.wav
+
+# 清理 vendor 时的隔离目录（正常情况下跑完 --purge 就没了）
+_vendor_trash/
+
+# 运行时数据（本地隐私/可再生成）
+activity_log.json
+weather_cache.json
+study_records.json
+diary.json
+app_paths.json
+
+# ---------------------------------------------------------------------------
+# 私人内容（不上传）
+# ---------------------------------------------------------------------------
+# 私人歌曲库（自备音乐放这里）
+music/
+
+# 运行时生成的本地对话库（由 _rebuild_dialogues.py 生成；
+# 缺失时 lines.py 里的 DEFAULT_DIALOGUES 兜底）
+dialogues.txt
+
+# 历史备份 / 一次性脚本，与运行无关
+oc.py.before_entry_split
+_sing_test_out.txt
+_fetch_bili.py
+_fetch_file.py
+_clean_vendor.py
+_move_tests.py
+_split.py
+_write_diary_data.py
+
